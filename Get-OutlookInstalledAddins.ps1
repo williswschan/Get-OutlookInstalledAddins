@@ -5,10 +5,33 @@
 .DESCRIPTION
     Reads the COM add-ins that classic Outlook shows on the Add-ins page.
     Each row is the add-in name and a status of Active, Inactive, or Disabled.
+    The script uses cmdlets, operators, and PowerShell core types so it can run
+    when Constrained Language mode is turned on.
 
 .EXAMPLE
     .\Get-OutlookInstalledAddins.ps1
 #>
+
+Function New-CoreObject {
+    Param(
+        [Hashtable]$Property
+    )
+
+    # [PSCustomObject] is rejected in Constrained Language mode.
+    Return (New-Object -TypeName PSObject -Property $Property)
+}
+
+Function Test-Blank {
+    Param(
+        [String]$Value
+    )
+
+    If ($Null -Eq $Value) {
+        Return $True
+    }
+
+    Return ($Value.Trim().Length -Eq 0)
+}
 
 Function Get-LoadBehaviorDescription {
     Param(
@@ -25,34 +48,65 @@ Function Get-LoadBehaviorDescription {
     Return "Inactive"
 }
 
-Function Get-ReadableStringsFromBytes {
+Function Get-TextPiecesFromBytes {
     Param(
-        [Byte[]]$Bytes
+        $Bytes
     )
 
-    $Results = New-Object System.Collections.Generic.List[String]
-    If ($Null -Eq $Bytes -Or $Bytes.Length -Eq 0) {
+    $ByteList = @($Bytes)
+    $Length = $ByteList.Count
+    If ($Length -Eq 0) {
         Return
     }
 
-    $Decoded = @(
-        [System.Text.Encoding]::Unicode.GetString($Bytes),
-        [System.Text.Encoding]::ASCII.GetString($Bytes)
-    )
-
-    ForEach ($Text in $Decoded) {
-        $Found = [Regex]::Matches($Text, "[A-Za-z0-9][A-Za-z0-9 \._\-\+\:\\]{3,}")
-        ForEach ($Match in $Found) {
-            $Value = $Match.Value.Trim()
-            If ($Value.Length -Ge 4 -And -Not $Results.Contains($Value)) {
-                $Results.Add($Value) | Out-Null
+    $Seen = @{}
+    $Modes = @(2, 1)
+    ForEach ($Step in $Modes) {
+        $Builder = ""
+        For ($Index = 0; $Index -Lt $Length; $Index += $Step) {
+            $Code = -1
+            If ($Step -Eq 2) {
+                If (($Index + 1) -Ge $Length) {
+                    Break
+                }
+                $Code = [Int]$ByteList[$Index] + (256 * [Int]$ByteList[$Index + 1])
             }
+            Else {
+                $Code = [Int]$ByteList[$Index]
+            }
+
+            $IsPrintable = ($Code -Ge 32 -And $Code -Le 126)
+            If ($IsPrintable) {
+                $Builder += [Char]$Code
+                Continue
+            }
+
+            If ($Builder.Length -Ge 4 -And -Not $Seen.ContainsKey($Builder)) {
+                $Seen[$Builder] = $True
+                Write-Output $Builder
+            }
+            $Builder = ""
+        }
+
+        If ($Builder.Length -Ge 4 -And -Not $Seen.ContainsKey($Builder)) {
+            $Seen[$Builder] = $True
+            Write-Output $Builder
         }
     }
+}
 
-    ForEach ($Value in $Results) {
-        Write-Output $Value
+Function Get-RegistryDefaultValue {
+    Param(
+        [String]$Path
+    )
+
+    $Properties = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
+    $DefaultValue = $Properties.'(default)'
+    If (Test-Blank -Value ([String]$DefaultValue)) {
+        Return
     }
+
+    Return [String]$DefaultValue
 }
 
 Function Get-ComServerPath {
@@ -60,7 +114,7 @@ Function Get-ComServerPath {
         [String]$ProgId
     )
 
-    If ([String]::IsNullOrWhiteSpace($ProgId)) {
+    If (Test-Blank -Value $ProgId) {
         Return
     }
 
@@ -77,14 +131,15 @@ Function Get-ComServerPath {
             Continue
         }
 
+        $Clsid = ""
         Try {
-            $Clsid = (Get-Item -LiteralPath $ClsidKey -ErrorAction Stop).GetValue([String]::Empty)
+            $Clsid = Get-RegistryDefaultValue -Path $ClsidKey
         }
         Catch {
             Continue
         }
 
-        If ([String]::IsNullOrWhiteSpace([String]$Clsid)) {
+        If (Test-Blank -Value $Clsid) {
             Continue
         }
 
@@ -98,14 +153,15 @@ Function Get-ComServerPath {
                 Continue
             }
 
+            $ServerPath = ""
             Try {
-                $ServerPath = (Get-Item -LiteralPath $ServerKey -ErrorAction Stop).GetValue([String]::Empty)
+                $ServerPath = Get-RegistryDefaultValue -Path $ServerKey
             }
             Catch {
                 Continue
             }
 
-            If (-Not [String]::IsNullOrWhiteSpace([String]$ServerPath)) {
+            If (-Not (Test-Blank -Value $ServerPath)) {
                 Return [String]$ServerPath
             }
         }
@@ -117,7 +173,7 @@ Function Get-AddinFileLeaf {
         [String]$Path
     )
 
-    If ([String]::IsNullOrWhiteSpace($Path)) {
+    If (Test-Blank -Value $Path) {
         Return
     }
 
@@ -125,11 +181,15 @@ Function Get-AddinFileLeaf {
     If ($Clean -Like "file:*") {
         $Clean = $Clean -Replace '^file:[/\\]*', ''
         $Clean = ($Clean -Split '\|')[0]
-        $Clean = $Clean -Replace '/', '\'
+        $Clean = $Clean -Replace '\\', '/'
+    }
+    Else {
+        $Clean = $Clean -Replace '\\', '/'
     }
 
-    $Leaf = [System.IO.Path]::GetFileName($Clean)
-    If ([String]::IsNullOrWhiteSpace($Leaf)) {
+    $Parts = @($Clean -Split '/')
+    $Leaf = [String]$Parts[$Parts.Count - 1]
+    If (Test-Blank -Value $Leaf) {
         Return
     }
 
@@ -142,27 +202,43 @@ Function Get-DisabledAddinMarkers {
         Return
     }
 
+    $Properties = $Null
     Try {
-        $DisabledKey = Get-Item -LiteralPath $DisabledPath -ErrorAction Stop
+        $Properties = Get-ItemProperty -LiteralPath $DisabledPath -ErrorAction Stop
     }
     Catch {
         Write-Warning "[WARN] Could not read $DisabledPath. $($_.Exception.Message)"
         Return
     }
 
-    ForEach ($ValueName in @($DisabledKey.GetValueNames())) {
-        If ([String]::IsNullOrWhiteSpace($ValueName)) {
+    $SkipNames = @(
+        "PSPath",
+        "PSParentPath",
+        "PSChildName",
+        "PSDrive",
+        "PSProvider"
+    )
+
+    ForEach ($Property in @($Properties.PSObject.Properties)) {
+        $Name = [String]$Property.Name
+        $Skip = $False
+        ForEach ($SkipName in $SkipNames) {
+            If ($Name -Eq $SkipName) {
+                $Skip = $True
+            }
+        }
+        If ($Skip) {
             Continue
         }
 
-        If ($DisabledKey.GetValueKind($ValueName) -Ne [Microsoft.Win32.RegistryValueKind]::Binary) {
-            Write-Output ([String]$DisabledKey.GetValue($ValueName))
+        $Data = $Property.Value
+        If ($Data -Is [String]) {
+            Write-Output ([String]$Data)
             Continue
         }
 
-        $Strings = @(Get-ReadableStringsFromBytes -Bytes ([Byte[]]$DisabledKey.GetValue($ValueName)))
-        ForEach ($Text in $Strings) {
-            Write-Output $Text
+        If ($Data -Is [Byte[]]) {
+            Get-TextPiecesFromBytes -Bytes $Data
         }
     }
 }
@@ -184,6 +260,7 @@ Function Get-OutlookComAddins {
             Continue
         }
 
+        $AddinKeys = @()
         Try {
             $AddinKeys = @(Get-ChildItem -LiteralPath $RegistryPath -ErrorAction Stop)
         }
@@ -193,6 +270,7 @@ Function Get-OutlookComAddins {
         }
 
         ForEach ($Key in $AddinKeys) {
+            $Properties = $Null
             Try {
                 $Properties = Get-ItemProperty -LiteralPath $Key.PSPath -ErrorAction Stop
             }
@@ -202,26 +280,24 @@ Function Get-OutlookComAddins {
             }
 
             $ProgId = [String]$Key.PSChildName
-            $KeyId = $ProgId.ToLowerInvariant()
+            $KeyId = $ProgId.ToLower()
             $FriendlyName = [String]$Properties.FriendlyName
             $Description = [String]$Properties.Description
             $FileHint = [String]$Properties.FileName
-            If ([String]::IsNullOrWhiteSpace($FileHint)) {
+            If (Test-Blank -Value $FileHint) {
                 $FileHint = [String]$Properties.Manifest
             }
 
             $HasLoadBehavior = $False
             $LoadBehaviorNumber = 0
-            $ParsedLoadBehavior = 0
-            If ($Null -Ne $Properties.PSObject.Properties["LoadBehavior"]) {
-                If ([Int]::TryParse([String]$Properties.LoadBehavior, [Ref]$ParsedLoadBehavior)) {
-                    $HasLoadBehavior = $True
-                    $LoadBehaviorNumber = $ParsedLoadBehavior
-                }
+            $LoadBehaviorText = [String]$Properties.LoadBehavior
+            If ($LoadBehaviorText -Match '^\d+$') {
+                $HasLoadBehavior = $True
+                $LoadBehaviorNumber = [Int]$LoadBehaviorText
             }
 
             If (-Not $Index.ContainsKey($KeyId)) {
-                $Index[$KeyId] = [PSCustomObject]@{
+                $Index[$KeyId] = New-CoreObject -Property @{
                     ProgId          = $ProgId
                     Name            = $FriendlyName
                     Description     = $Description
@@ -233,16 +309,16 @@ Function Get-OutlookComAddins {
             }
 
             $Existing = $Index[$KeyId]
-            If ([String]::IsNullOrWhiteSpace($Existing.Name) -And -Not [String]::IsNullOrWhiteSpace($FriendlyName)) {
+            If ((Test-Blank -Value $Existing.Name) -And -Not (Test-Blank -Value $FriendlyName)) {
                 $Existing.Name = $FriendlyName
             }
-            If ([String]::IsNullOrWhiteSpace($Existing.Description) -And -Not [String]::IsNullOrWhiteSpace($Description)) {
+            If ((Test-Blank -Value $Existing.Description) -And -Not (Test-Blank -Value $Description)) {
                 $Existing.Description = $Description
             }
-            If ([String]::IsNullOrWhiteSpace($Existing.FileHint) -And -Not [String]::IsNullOrWhiteSpace($FileHint)) {
+            If ((Test-Blank -Value $Existing.FileHint) -And -Not (Test-Blank -Value $FileHint)) {
                 $Existing.FileHint = $FileHint
             }
-            If (-Not $Existing.HasLoadBehavior -And $HasLoadBehavior) {
+            If ((-Not $Existing.HasLoadBehavior) -And $HasLoadBehavior) {
                 $Existing.HasLoadBehavior = $True
                 $Existing.LoadBehavior = $LoadBehaviorNumber
             }
@@ -250,11 +326,11 @@ Function Get-OutlookComAddins {
     }
 
     $DisabledMarkers = @(Get-DisabledAddinMarkers)
-    $Records = New-Object System.Collections.Generic.List[Object]
+    $Records = @()
 
     ForEach ($KeyId in @($Index.Keys)) {
         $Entry = $Index[$KeyId]
-        If ([String]::IsNullOrWhiteSpace($Entry.Name) -And [String]::IsNullOrWhiteSpace($Entry.Description)) {
+        If ((Test-Blank -Value $Entry.Name) -And (Test-Blank -Value $Entry.Description)) {
             Continue
         }
 
@@ -266,13 +342,13 @@ Function Get-OutlookComAddins {
         $Status = Get-LoadBehaviorDescription -LoadBehavior $LoadBehaviorNumber
         If ($DisabledMarkers.Count -Gt 0) {
             $FileLeaf = Get-AddinFileLeaf -Path $Entry.FileHint
-            If ([String]::IsNullOrWhiteSpace($FileLeaf)) {
+            If (Test-Blank -Value $FileLeaf) {
                 $FileLeaf = Get-AddinFileLeaf -Path (Get-ComServerPath -ProgId $Entry.ProgId)
             }
 
             ForEach ($Marker in $DisabledMarkers) {
                 $MatchesProgId = $Marker -Like "*$($Entry.ProgId)*"
-                $MatchesFile = (-Not [String]::IsNullOrWhiteSpace($FileLeaf)) -And ($Marker -Like "*$FileLeaf*")
+                $MatchesFile = (-Not (Test-Blank -Value $FileLeaf)) -And ($Marker -Like "*$FileLeaf*")
                 If ($MatchesProgId -Or $MatchesFile) {
                     $Status = "Disabled"
                     Break
@@ -281,14 +357,14 @@ Function Get-OutlookComAddins {
         }
 
         $Name = [String]$Entry.Name
-        If ([String]::IsNullOrWhiteSpace($Name)) {
+        If (Test-Blank -Value $Name) {
             $Name = $Entry.ProgId
         }
 
-        $Records.Add([PSCustomObject]@{
+        $Records += New-CoreObject -Property @{
             Name   = $Name
             Status = $Status
-        }) | Out-Null
+        }
     }
 
     $StatusRank = @{
@@ -296,10 +372,7 @@ Function Get-OutlookComAddins {
         Inactive = 1
         Disabled = 2
     }
-    $Sorted = @($Records | Sort-Object @{ Expression = { $StatusRank[$_.Status] } }, Name)
-    ForEach ($Record in $Sorted) {
-        Write-Output $Record
-    }
+    Return @($Records | Sort-Object @{ Expression = { $StatusRank[$_.Status] } }, Name)
 }
 
 $ComAddins = @(Get-OutlookComAddins)
